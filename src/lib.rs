@@ -214,6 +214,7 @@ pub use cpal::{
 };
 
 mod common;
+mod playback_controls;
 mod player;
 mod spatial_player;
 #[cfg(all(feature = "playback", feature = "experimental"))]

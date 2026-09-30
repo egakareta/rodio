@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(feature = "crossbeam-channel")]
@@ -9,6 +9,7 @@ use dasp_sample::FromSample;
 use std::sync::mpsc::{Receiver, Sender};
 
 use crate::mixer::Mixer;
+use crate::playback_controls::{AtomicOption, AtomicPosition, AtomicVolume};
 use crate::source::SeekError;
 use crate::Float;
 use crate::{queue, source::Done, Source};
@@ -19,7 +20,7 @@ use crate::{queue, source::Done, Source};
 /// playing.
 pub struct Player {
     queue_tx: Arc<queue::SourcesQueueInput>,
-    sleep_until_end: Mutex<Option<Receiver<()>>>,
+    sleep_until_end: AtomicOption<Receiver<()>>,
 
     controls: Arc<Controls>,
     sound_count: Arc<AtomicUsize>,
@@ -48,23 +49,28 @@ impl SeekOrder {
         (Self { pos, feedback: tx }, rx)
     }
 
-    fn attempt<S>(self, maybe_seekable: &mut S)
+    fn attempt<S>(self, maybe_seekable: &mut S, position: &AtomicPosition)
     where
         S: Source,
     {
         let res = maybe_seekable.try_seek(self.pos);
+        if res.is_ok() {
+            // Keep the sample generator as the sole position writer. Publish before
+            // acknowledging the seek so get_pos observes it when try_seek returns.
+            position.store(self.pos);
+        }
         let _ignore_receiver_dropped = self.feedback.send(res);
     }
 }
 
 struct Controls {
     pause: AtomicBool,
-    volume: Mutex<Float>,
+    volume: AtomicVolume,
     stopped: AtomicBool,
-    speed: Mutex<f32>,
-    to_clear: Mutex<u32>,
-    seek: Mutex<Option<SeekOrder>>,
-    position: Mutex<Duration>,
+    speed: AtomicU32,
+    to_clear: AtomicU32,
+    seek: AtomicOption<SeekOrder>,
+    position: AtomicPosition,
 }
 
 impl Player {
@@ -83,15 +89,15 @@ impl Player {
 
         let sink = Player {
             queue_tx,
-            sleep_until_end: Mutex::new(None),
+            sleep_until_end: AtomicOption::new(),
             controls: Arc::new(Controls {
                 pause: AtomicBool::new(false),
-                volume: Mutex::new(1.0),
+                volume: AtomicVolume::new(1.0),
                 stopped: AtomicBool::new(false),
-                speed: Mutex::new(1.0),
-                to_clear: Mutex::new(0),
-                seek: Mutex::new(None),
-                position: Mutex::new(Duration::ZERO),
+                speed: AtomicU32::new(1.0f32.to_bits()),
+                to_clear: AtomicU32::new(0),
+                seek: AtomicOption::new(),
+                position: AtomicPosition::new(Duration::ZERO),
             }),
             sound_count: Arc::new(AtomicUsize::new(0)),
             detached: false,
@@ -138,35 +144,39 @@ impl Player {
         .periodic_access(Duration::from_millis(5), move |src| {
             if controls.stopped.load(Ordering::SeqCst) {
                 src.inner_mut().stop();
-                *controls.position.lock().unwrap() = Duration::ZERO;
+                controls.position.store(Duration::ZERO);
             }
+            if controls
+                .to_clear
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |pending| {
+                    pending.checked_sub(1)
+                })
+                .is_ok()
             {
-                let mut to_clear = controls.to_clear.lock().unwrap();
-                if *to_clear > 0 {
-                    src.inner_mut().inner_mut().skip();
-                    *to_clear -= 1;
-                    *controls.position.lock().unwrap() = Duration::ZERO;
-                } else {
-                    *controls.position.lock().unwrap() =
-                        src.inner().inner().inner().inner().inner().get_pos();
-                }
+                src.inner_mut().inner_mut().skip();
+                controls.position.store(Duration::ZERO);
+            } else {
+                controls
+                    .position
+                    .store(src.inner().inner().inner().inner().inner().get_pos());
             }
             let amp = src.inner_mut().inner_mut().inner_mut();
-            amp.set_factor(*controls.volume.lock().unwrap());
+            amp.set_factor(controls.volume.load());
             amp.inner_mut()
                 .set_paused(controls.pause.load(Ordering::SeqCst));
             amp.inner_mut()
                 .inner_mut()
                 .inner_mut()
-                .set_factor(*controls.speed.lock().unwrap());
-            if let Some(seek) = controls.seek.lock().unwrap().take() {
-                seek.attempt(amp)
+                .set_factor(f32::from_bits(controls.speed.load(Ordering::Relaxed)));
+            if let Some(seek) = controls.seek.take() {
+                seek.attempt(amp, &controls.position)
             }
             start_played.store(true, Ordering::SeqCst);
         });
 
         self.sound_count.fetch_add(1, Ordering::Relaxed);
-        *self.sleep_until_end.lock().unwrap() = Some(self.queue_tx.append_with_signal(source));
+        self.sleep_until_end
+            .replace(self.queue_tx.append_with_signal(source));
     }
 
     /// Gets the volume of the sound.
@@ -175,7 +185,7 @@ impl Player {
     /// multiply each sample by this value.
     #[inline]
     pub fn volume(&self) -> Float {
-        *self.controls.volume.lock().unwrap()
+        self.controls.volume.load()
     }
 
     /// Changes the volume of the sound.
@@ -184,7 +194,7 @@ impl Player {
     /// multiply each sample by this value.
     #[inline]
     pub fn set_volume(&self, value: Float) {
-        *self.controls.volume.lock().unwrap() = value;
+        self.controls.volume.store(value);
     }
 
     /// Gets the speed of the sound.
@@ -192,7 +202,7 @@ impl Player {
     /// See [`Player::set_speed`] for details on what *speed* means.
     #[inline]
     pub fn speed(&self) -> f32 {
-        *self.controls.speed.lock().unwrap()
+        f32::from_bits(self.controls.speed.load(Ordering::Relaxed))
     }
 
     /// Changes the play speed of the sound. Does not adjust the samples, only the playback speed.
@@ -210,7 +220,9 @@ impl Player {
     ///
     #[inline]
     pub fn set_speed(&self, value: f32) {
-        *self.controls.speed.lock().unwrap() = value;
+        self.controls
+            .speed
+            .store(value.to_bits(), Ordering::Relaxed);
     }
 
     /// Resumes playback of a paused player.
@@ -245,7 +257,7 @@ impl Player {
     /// function might return an error if the duration of the source is not known.
     pub fn try_seek(&self, pos: Duration) -> Result<(), SeekError> {
         let (order, feedback) = SeekOrder::new(pos);
-        *self.controls.seek.lock().unwrap() = Some(order);
+        self.controls.seek.replace(order);
 
         if self.sound_count.load(Ordering::Acquire) == 0 {
             // No sound is playing, seek will not be performed
@@ -253,10 +265,7 @@ impl Player {
         }
 
         match feedback.recv() {
-            Ok(seek_res) => {
-                *self.controls.position.lock().unwrap() = pos;
-                seek_res
-            }
+            Ok(seek_res) => seek_res,
             // The feedback channel closed. Probably another SeekOrder was set
             // invalidating this one and closing the feedback channel
             // ... or the audio thread panicked.
@@ -286,7 +295,7 @@ impl Player {
     /// See `pause()` for information about pausing a `Player`.
     pub fn clear(&self) {
         let len = self.sound_count.load(Ordering::SeqCst) as u32;
-        *self.controls.to_clear.lock().unwrap() = len;
+        self.controls.to_clear.store(len, Ordering::SeqCst);
         self.sound_count.store(0, Ordering::Relaxed);
         self.pause();
     }
@@ -298,11 +307,20 @@ impl Player {
     /// it had finished playing a `Source` all the way through.
     pub fn skip_one(&self) {
         let len = self.sound_count.load(Ordering::SeqCst) as u32;
-        let mut to_clear = self.controls.to_clear.lock().unwrap();
-        if len > *to_clear {
-            *to_clear += 1;
+        if self
+            .controls
+            .to_clear
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |pending| {
+                (len > pending).then(|| pending + 1)
+            })
+            .is_ok()
+        {
+            let _ = self
+                .sound_count
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                    count.checked_sub(1)
+                });
         }
-        self.sound_count.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// Stops the sink by emptying the queue.
@@ -320,7 +338,7 @@ impl Player {
     /// Sleeps the current thread until the sound ends.
     #[inline]
     pub fn sleep_until_end(&self) {
-        if let Some(sleep_until_end) = self.sleep_until_end.lock().unwrap().take() {
+        if let Some(sleep_until_end) = self.sleep_until_end.take() {
             let _ = sleep_until_end.recv();
         }
     }
@@ -347,7 +365,7 @@ impl Player {
     /// recording is *10s* from its start.
     #[inline]
     pub fn get_pos(&self) -> Duration {
-        *self.controls.position.lock().unwrap()
+        self.controls.position.load()
     }
 }
 
@@ -374,6 +392,9 @@ mod tests {
     fn test_immediate_length_changes() {
         let (player, mut source) = Player::new();
 
+        player.skip_one();
+        assert!(player.empty());
+
         player.append(SamplesBuffer::new(nz!(1), nz!(1), vec![2.0, 3.0]));
         player.append(SamplesBuffer::new(nz!(1), nz!(1), vec![1.0, 0.5]));
         assert_eq!(player.len(), 2);
@@ -385,6 +406,8 @@ mod tests {
 
         player.clear();
         assert_eq!(player.len(), 0);
+        player.skip_one();
+        assert!(player.empty());
     }
 
     #[test]
@@ -467,5 +490,108 @@ mod tests {
         for _ in 0..v.len() {
             assert_eq!(queue_rx.next(), src.next());
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn playback_advances_while_workers_query_and_update_controls() {
+        use std::sync::Barrier;
+
+        const WORKERS: usize = 16;
+        const SAMPLES: usize = 192_000;
+        let (player, mut output) = Player::new();
+        player.append(SamplesBuffer::new(nz!(1), nz!(24_000), vec![1.0; SAMPLES]));
+        let started = Barrier::new(WORKERS + 1);
+
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let player = &player;
+                let started = &started;
+                scope.spawn(move || {
+                    started.wait();
+                    let mut previous_position = std::time::Duration::ZERO;
+                    for _ in 0..10_000 {
+                        player.set_volume((worker % 4 + 1) as crate::Float / 4.0);
+                        player.set_speed(1.0);
+                        let position = player.get_pos();
+                        assert!(position >= previous_position);
+                        assert!(position <= std::time::Duration::from_secs(8));
+                        assert!((0.25..=1.0).contains(&player.volume()));
+                        assert_eq!(player.speed(), 1.0);
+                        previous_position = position;
+                    }
+                });
+            }
+            started.wait();
+            for _ in 0..SAMPLES {
+                let sample = output.next().expect("the playing queue stays alive");
+                assert!(sample.is_finite());
+                assert!((0.0..=1.0).contains(&sample));
+            }
+        });
+
+        assert!(player.get_pos() > std::time::Duration::from_secs(7));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn paused_seek_reports_the_position_when_acknowledged() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let (player, mut output) = Player::new();
+        player.append(SamplesBuffer::new(nz!(1), nz!(48_000), vec![1.0; 96_000]));
+        player.pause();
+        let player = Arc::new(player);
+        let target = Duration::from_millis(1_250);
+        let seeking_player = Arc::clone(&player);
+        let seeking = std::thread::spawn(move || seeking_player.try_seek(target));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !seeking.is_finished() && Instant::now() < deadline {
+            assert_eq!(output.next(), Some(0.0));
+        }
+        assert!(
+            seeking.is_finished(),
+            "seek should complete while rendering"
+        );
+        seeking.join().unwrap().unwrap();
+        assert_eq!(player.get_pos(), target);
+        assert!(player.is_paused());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn failed_seek_preserves_playback_position() {
+        use std::time::{Duration, Instant};
+
+        let (player, mut output) = Player::new();
+        // Buffered sources expose playback but deliberately do not support seeking.
+        player.append(SamplesBuffer::new(nz!(1), nz!(48_000), vec![1.0; 96_000]).buffered());
+        for _ in 0..4_800 {
+            output.next().unwrap();
+        }
+        player.pause();
+        for _ in 0..480 {
+            output.next().unwrap();
+        }
+        let before = player.get_pos();
+        assert!(!before.is_zero());
+
+        std::thread::scope(|scope| {
+            let seeking = scope.spawn(|| player.try_seek(Duration::from_millis(1_250)));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !seeking.is_finished() && Instant::now() < deadline {
+                assert_eq!(output.next(), Some(0.0));
+            }
+            assert!(
+                seeking.is_finished(),
+                "seek should complete while rendering"
+            );
+            assert!(seeking.join().unwrap().is_err());
+        });
+
+        assert_eq!(player.get_pos(), before);
+        assert!(player.is_paused());
     }
 }
