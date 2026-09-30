@@ -666,6 +666,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "euphorium-rodio"
+version = "0.22.2"
+dependencies = [
+ "approx",
+ "atomic_float",
+ "clap",
+ "claxon",
+ "cpal",
+ "crossbeam-channel",
+ "dasp_sample",
+ "divan",
+ "hound",
+ "inquire",
+ "lewton",
+ "minimp3_fixed",
+ "quickcheck",
+ "rand 0.10.1",
+ "rand_distr",
+ "rstest",
+ "rstest_reuse",
+ "rtrb",
+ "rubato",
+ "symphonia",
+ "symphonia-adapter-fdk-aac",
+ "symphonia-adapter-libopus",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "extended"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1715,36 +1745,6 @@ name = "relative-path"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba39f3699c378cd8970968dcbff9c43159ea4cfbd88d43c00b22f2ef10a435d2"
-
-[[package]]
-name = "rodio"
-version = "0.22.2"
-dependencies = [
- "approx",
- "atomic_float",
- "clap",
- "claxon",
- "cpal",
- "crossbeam-channel",
- "dasp_sample",
- "divan",
- "hound",
- "inquire",
- "lewton",
- "minimp3_fixed",
- "quickcheck",
- "rand 0.10.1",
- "rand_distr",
- "rstest",
- "rstest_reuse",
- "rtrb",
- "rubato",
- "symphonia",
- "symphonia-adapter-fdk-aac",
- "symphonia-adapter-libopus",
- "thiserror 2.0.18",
- "tracing",
-]
 
 [[package]]
 name = "rstest"

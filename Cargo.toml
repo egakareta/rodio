@@ -1,14 +1,17 @@
 [package]
-name = "rodio"
+name = "euphorium-rodio"
 version = "0.22.2"
 license = "MIT OR Apache-2.0"
 description = "Audio playback and recording library"
 keywords = ["audio", "playback", "recording", "gamedev"]
-repository = "https://github.com/RustAudio/rodio"
-documentation = "https://docs.rs/rodio"
+repository = "https://github.com/egakareta/rodio"
+documentation = "https://docs.rs/euphorium-rodio"
 exclude = ["assets/**", "tests/**"]
 edition = "2021"
 rust-version = "1.95"
+
+[lib]
+name = "rodio"
 
 [features]
 default = [
