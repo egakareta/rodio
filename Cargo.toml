@@ -1,6 +1,6 @@
 [package]
 name = "euphorium-rodio"
-version = "0.22.2"
+version = "0.22.2-euph.1"
 license = "MIT OR Apache-2.0"
 description = "Audio playback and recording library"
 keywords = ["audio", "playback", "recording", "gamedev"]
